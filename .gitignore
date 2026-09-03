@@ -1,0 +1,33 @@
+# Android / Gradle
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+build/
+.gradle/
+local.properties
+captures/
+.cxx/
+release/
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+
+# Recorded fixtures are committed deliberately as test data.
+!fixtures/*.tlog
