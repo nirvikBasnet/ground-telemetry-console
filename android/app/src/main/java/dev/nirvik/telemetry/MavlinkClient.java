@@ -1,218 +1,147 @@
 package dev.nirvik.telemetry;
 
-import io.dronefleet.mavlink.MavlinkConnection;
-import io.dronefleet.mavlink.MavlinkMessage;
-import io.dronefleet.mavlink.common.Attitude;
-import io.dronefleet.mavlink.common.GlobalPositionInt;
-import io.dronefleet.mavlink.common.SysStatus;
-import io.dronefleet.mavlink.minimal.Heartbeat;
-import io.dronefleet.mavlink.minimal.MavAutopilot;
-import io.dronefleet.mavlink.minimal.MavModeFlag;
-import io.dronefleet.mavlink.minimal.MavType;
+import android.util.Log;
 
-import java.io.BufferedInputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-/**
- * Owns the TCP socket to MAVProxy and turns the MAVLink stream into {@link TelemetryState}
- * snapshots. All callbacks are delivered on the read thread; the caller is responsible for
- * marshalling to whatever thread it needs.
- */
-public class MavlinkClient {
+import io.dronefleet.mavlink.MavlinkConnection;
+import io.dronefleet.mavlink.MavlinkMessage;
+import io.dronefleet.mavlink.minimal.Heartbeat;
+import io.dronefleet.mavlink.minimal.MavAutopilot;
+import io.dronefleet.mavlink.minimal.MavState;
+import io.dronefleet.mavlink.minimal.MavType;
 
-    public interface Listener {
-        void onState(TelemetryState state);
+public final class MavlinkClient implements TelemetrySource {
 
-        void onLog(String message);
-    }
+    private static final String TAG = "MavlinkClient";
+    private static final String HOST = "10.0.2.2";
+    private static final int PORT = 14550;
+    private static final int SYSTEM_ID = 255;
+    private static final int COMPONENT_ID = 190;
 
-    private static final int CONNECT_TIMEOUT_MS = 5000;
-    private static final int HEARTBEAT_INTERVAL_MS = 1000;
+    private final Clock clock;
+    private final MavlinkParser parser;
+    private final LinkMonitor monitor = new LinkMonitor();
+    private final Backoff backoff = new Backoff();
+    private final AtomicBoolean running = new AtomicBoolean(false);
 
-    /** GCS convention: system 255, component 190 (MAV_COMP_ID_MISSIONPLANNER). */
-    private static final int GCS_SYSTEM_ID = 255;
-    private static final int GCS_COMPONENT_ID = 190;
-
-    private final String host;
-    private final int port;
-    private final Listener listener;
-
-    private volatile boolean running;
-    private volatile Socket socket;
-    private volatile MavlinkConnection connection;
+    private volatile boolean socketOpen = false;
+    private volatile long nextRetryAtMs = 0;
+    private Listener listener;
     private Thread readThread;
-    private Thread heartbeatThread;
 
-    private TelemetryState state = TelemetryState.EMPTY;
-
-    public MavlinkClient(String host, int port, Listener listener) {
-        this.host = host;
-        this.port = port;
-        this.listener = listener;
+    public MavlinkClient(Clock clock) {
+        this.clock = clock;
+        this.parser = new MavlinkParser(clock);
     }
 
-    public void start() {
-        if (running) {
-            return;
-        }
-        running = true;
-        readThread = new Thread(this::runReadLoop, "mavlink-read");
+    @Override
+    public void start(Listener listener) {
+        this.listener = listener;
+        if (!running.compareAndSet(false, true)) return;
+        readThread = new Thread(this::loop, "mavlink-read");
         readThread.start();
     }
 
+    @Override
     public void stop() {
-        running = false;
-        // Closing the socket is what unblocks connection.next() inside the read loop.
-        Socket s = socket;
-        if (s != null) {
-            try {
-                s.close();
-            } catch (IOException ignored) {
-                // Nothing useful to do; the read loop is going to exit either way.
-            }
-        }
+        running.set(false);
+        if (readThread != null) readThread.interrupt();
     }
 
-    private void runReadLoop() {
-        try {
-            listener.onLog("Connecting to " + host + ":" + port + "...");
-            Socket s = new Socket();
-            s.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
-            socket = s;
-
-            InputStream in = new BufferedInputStream(s.getInputStream());
-            OutputStream out = s.getOutputStream();
-            connection = MavlinkConnection.create(in, out);
-            listener.onLog("Connected.");
-
-            heartbeatThread = new Thread(this::runHeartbeatLoop, "mavlink-heartbeat");
-            heartbeatThread.start();
-
-            MavlinkMessage<?> message;
-            while (running && (message = connection.next()) != null) {
-                handle(message.getPayload());
-            }
-        } catch (IOException e) {
-            if (running) {
-                listener.onLog("Connection error: " + e.getMessage());
-            }
-        } finally {
-            Socket s = socket;
-            if (s != null) {
-                try {
-                    s.close();
-                } catch (IOException ignored) {
-                    // Already tearing down.
-                }
-            }
-            socket = null;
-            connection = null;
-            running = false;
-            listener.onLog("Disconnected.");
-        }
-    }
-
-    private void runHeartbeatLoop() {
-        // ArduPilot stops streaming to a GCS that goes quiet, so this has to keep ticking
-        // independently of whatever the read loop is doing.
-        Heartbeat heartbeat =
-                Heartbeat.builder()
-                        .type(MavType.MAV_TYPE_GCS)
-                        .autopilot(MavAutopilot.MAV_AUTOPILOT_INVALID)
-                        .mavlinkVersion(3)
-                        .build();
-        while (running) {
-            MavlinkConnection c = connection;
-            if (c != null) {
-                try {
-                    c.send2(GCS_SYSTEM_ID, GCS_COMPONENT_ID, heartbeat);
-                } catch (IOException e) {
-                    if (running) {
-                        listener.onLog("Heartbeat failed: " + e.getMessage());
-                    }
-                    return;
-                }
-            }
+    private void loop() {
+        while (running.get()) {
+            Socket socket = null;
+            Thread heartbeat = null;
             try {
-                Thread.sleep(HEARTBEAT_INTERVAL_MS);
+                log("connecting to " + HOST + ":" + PORT);
+                socket = new Socket();
+                socket.connect(new InetSocketAddress(HOST, PORT), 5_000);
+                socketOpen = true;
+                backoff.reset();
+                nextRetryAtMs = 0;
+                parser.resetOrdering();
+                log("connected");
+
+                MavlinkConnection connection = MavlinkConnection.create(
+                        socket.getInputStream(), socket.getOutputStream());
+                heartbeat = startHeartbeat(connection);
+
+                while (running.get()) {
+                    MavlinkMessage<?> message = connection.next();
+                    if (message == null) break;
+                    parser.apply(message.getPayload());
+                }
+            } catch (IOException e) {
+                Log.w(TAG, "link error", e);
+                log("link error: " + e.getMessage());
+            } finally {
+                socketOpen = false;
+                if (heartbeat != null) heartbeat.interrupt();
+                closeQuietly(socket);
+            }
+
+            if (!running.get()) break;
+
+            long delay = backoff.nextDelayMs();
+            nextRetryAtMs = clock.elapsedRealtime() + delay;
+            log("reconnecting in " + delay + "ms (attempt " + backoff.attempt() + ")");
+            try {
+                Thread.sleep(delay);
             } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
                 return;
             }
         }
+        log("stopped");
     }
 
-    /**
-     * The live stream carries roughly 30 message types at ~4 Hz each. Everything outside the four
-     * types below is dropped here, before any state is built.
-     */
-    private void handle(Object payload) {
-        if (!(payload instanceof GlobalPositionInt)
-                && !(payload instanceof Attitude)
-                && !(payload instanceof SysStatus)
-                && !(payload instanceof Heartbeat)) {
-            return;
-        }
-
-        long now = System.currentTimeMillis();
-
-        if (payload instanceof GlobalPositionInt) {
-            GlobalPositionInt p = (GlobalPositionInt) payload;
-            // lat/lon are degrees * 1e7, relativeAlt is mm above home,
-            // vx/vy are cm/s, hdg is centidegrees.
-            double groundSpeedMs = Math.hypot(p.vx(), p.vy()) / 100.0;
-            state =
-                    state.withPosition(
-                            p.lat() / 1e7,
-                            p.lon() / 1e7,
-                            p.relativeAlt() / 1000.0,
-                            groundSpeedMs,
-                            p.hdg() / 100.0,
-                            now);
-        } else if (payload instanceof Attitude) {
-            Attitude a = (Attitude) payload;
-            // roll/pitch arrive in radians.
-            state = state.withAttitude(Math.toDegrees(a.roll()), Math.toDegrees(a.pitch()), now);
-        } else if (payload instanceof SysStatus) {
-            SysStatus s = (SysStatus) payload;
-            // voltageBattery is millivolts.
-            state = state.withPower(s.voltageBattery() / 1000.0, s.batteryRemaining(), now);
-        } else {
-            Heartbeat h = (Heartbeat) payload;
-            boolean armed =
-                    h.baseMode() != null
-                            && h.baseMode().flagsEnabled(MavModeFlag.MAV_MODE_FLAG_SAFETY_ARMED);
-            state = state.withStatus(flightModeName(h.customMode()), armed, now);
-        }
-
-        listener.onState(state);
+    private Thread startHeartbeat(MavlinkConnection connection) {
+        Thread t = new Thread(() -> {
+            Heartbeat beat = Heartbeat.builder()
+                    .type(MavType.MAV_TYPE_GCS)
+                    .autopilot(MavAutopilot.MAV_AUTOPILOT_INVALID)
+                    .systemStatus(MavState.MAV_STATE_UNINIT)
+                    .mavlinkVersion(3)
+                    .build();
+            while (running.get() && socketOpen) {
+                try {
+                    connection.send2(SYSTEM_ID, COMPONENT_ID, beat);
+                    Thread.sleep(1_000);
+                } catch (InterruptedException e) {
+                    return;
+                } catch (IOException e) {
+                    return;
+                }
+            }
+        }, "mavlink-heartbeat");
+        t.start();
+        return t;
     }
 
-    /** ArduCopter custom mode numbers. */
-    private static String flightModeName(long customMode) {
-        switch ((int) customMode) {
-            case 0:
-                return "STABILIZE";
-            case 2:
-                return "ALT_HOLD";
-            case 3:
-                return "AUTO";
-            case 4:
-                return "GUIDED";
-            case 5:
-                return "LOITER";
-            case 6:
-                return "RTL";
-            case 7:
-                return "CIRCLE";
-            case 9:
-                return "LAND";
-            default:
-                return "MODE_" + customMode;
-        }
+    private void closeQuietly(Socket socket) {
+        if (socket == null) return;
+        try { socket.close(); } catch (IOException ignored) { }
     }
+
+    private void log(String message) {
+        Log.i(TAG, message);
+        if (listener != null) listener.onLog(message);
+    }
+
+    @Override public TelemetryState state() { return parser.state(); }
+
+    @Override public LinkState linkState(long nowMs) {
+        return monitor.evaluate(socketOpen, parser.lastHeartbeatAtMs(), nowMs);
+    }
+
+    @Override public long rejectedCount() { return parser.rejectedCount(); }
+
+    @Override public long nextRetryInMs(long nowMs) {
+        return nextRetryAtMs == 0 ? 0 : Math.max(0, nextRetryAtMs - nowMs);
+    }
+
+    @Override public String name() { return "SITL " + HOST + ":" + PORT; }
 }

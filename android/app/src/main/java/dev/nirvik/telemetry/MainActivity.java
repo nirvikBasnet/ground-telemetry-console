@@ -3,99 +3,132 @@ package dev.nirvik.telemetry;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.widget.Button;
 import android.widget.TextView;
 
-import androidx.activity.EdgeToEdge;
 import androidx.appcompat.app.AppCompatActivity;
-import androidx.core.graphics.Insets;
-import androidx.core.view.ViewCompat;
-import androidx.core.view.WindowInsetsCompat;
 
-import java.text.SimpleDateFormat;
-import java.util.Date;
 import java.util.Locale;
 
-public class MainActivity extends AppCompatActivity implements MavlinkClient.Listener {
+public class MainActivity extends AppCompatActivity implements TelemetrySource.Listener {
 
-    /** The Docker host as seen from the Android emulator. */
-    private static final String HOST = "10.0.2.2";
-    private static final int PORT = 14550;
+    private static final long RENDER_INTERVAL_MS = 100;
 
-    private final Handler handler = new Handler(Looper.getMainLooper());
-    private final SimpleDateFormat timeFormat =
-            new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
+    private TextView view;
+    private Button toggle;
+    private final Clock clock = new AndroidClock();
+    private final Handler ui = new Handler(Looper.getMainLooper());
 
-    private TextView telemetry;
-    private MavlinkClient client;
-
-    // Both only ever touched on the UI thread.
-    private TelemetryState state = TelemetryState.EMPTY;
+    private TelemetrySource source;
+    private boolean replaying = false;
     private String lastLog = "";
+
+    private final Runnable renderLoop = new Runnable() {
+        @Override
+        public void run() {
+            render();
+            ui.postDelayed(this, RENDER_INTERVAL_MS);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        EdgeToEdge.enable(this);
         setContentView(R.layout.activity_main);
-        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main), (v, insets) -> {
-            Insets systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars());
-            v.setPadding(systemBars.left, systemBars.top, systemBars.right, systemBars.bottom);
-            return insets;
-        });
+        view = findViewById(R.id.telemetry);
+        toggle = findViewById(R.id.toggleSource);
+        toggle.setOnClickListener(v -> switchSource());
+        startSource(new MavlinkClient(clock));
+    }
 
-        telemetry = findViewById(R.id.telemetry);
-        render();
+    @Override
+    protected void onResume() {
+        super.onResume();
+        ui.post(renderLoop);
+    }
 
-        client = new MavlinkClient(HOST, PORT, this);
-        client.start();
+    @Override
+    protected void onPause() {
+        super.onPause();
+        ui.removeCallbacks(renderLoop);
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        client.stop();
+        if (source != null) source.stop();
     }
 
-    // MavlinkClient.Listener — both callbacks arrive on the network thread.
+    private void switchSource() {
+        if (source != null) source.stop();
+        replaying = !replaying;
+        toggle.setText(replaying ? "Switch to live" : "Switch to replay");
+        startSource(replaying
+                ? new ReplaySource(this, clock)
+                : new MavlinkClient(clock));
+    }
 
-    @Override
-    public void onState(TelemetryState newState) {
-        handler.post(() -> {
-            state = newState;
-            render();
-        });
+    private void startSource(TelemetrySource next) {
+        source = next;
+        source.start(this);
+    }
+
+    private void render() {
+        if (source == null) return;
+        long now = clock.elapsedRealtime();
+        TelemetryState s = source.state();
+        LinkState link = source.linkState(now);
+        long retry = source.nextRetryInMs(now);
+
+        StringBuilder b = new StringBuilder();
+        b.append("SOURCE    ").append(source.name()).append('\n');
+        b.append("LINK      ").append(link);
+        if (link == LinkState.LOST && retry > 0) {
+            b.append("  retry in ").append(retry / 1000).append('s');
+        }
+        b.append("\n\n");
+
+        b.append(line("MODE", s.flightMode, s.statusAtMs, s.statusFreshness(now), now));
+        b.append(line("ARMED", String.valueOf(s.armed), s.statusAtMs, s.statusFreshness(now), now));
+        b.append(line("LAT", String.format(Locale.US, "%.6f", s.latitude),
+                s.positionAtMs, s.positionFreshness(now), now));
+        b.append(line("LON", String.format(Locale.US, "%.6f", s.longitude),
+                s.positionAtMs, s.positionFreshness(now), now));
+        b.append(line("ALT", String.format(Locale.US, "%.1f m", s.relativeAltitudeM),
+                s.positionAtMs, s.positionFreshness(now), now));
+        b.append(line("HDG", String.format(Locale.US, "%.0f deg", s.headingDeg),
+                s.positionAtMs, s.positionFreshness(now), now));
+        b.append(line("ROLL", String.format(Locale.US, "%.1f deg", s.rollDeg),
+                s.attitudeAtMs, s.attitudeFreshness(now), now));
+        b.append(line("PITCH", String.format(Locale.US, "%.1f deg", s.pitchDeg),
+                s.attitudeAtMs, s.attitudeFreshness(now), now));
+        b.append(line("BATT", String.format(Locale.US, "%.2f V (%d%%)",
+                        s.batteryVolts, s.batteryPercent),
+                s.powerAtMs, s.powerFreshness(now), now));
+
+        b.append('\n');
+        b.append("REJECTED  ").append(source.rejectedCount()).append(" out-of-order\n");
+        b.append("LOG       ").append(lastLog);
+
+        view.setText(b.toString());
+    }
+
+    private String line(String label, String value, long atMs,
+                        Freshness freshness, long now) {
+        String age = atMs <= 0 ? "--" : ((now - atMs) / 100 / 10.0) + "s";
+        String marker;
+        switch (freshness) {
+            case FRESH:       marker = "   "; break;
+            case AGEING:      marker = " ? "; break;
+            case STALE:       marker = " ! "; break;
+            default:          marker = " - "; break;
+        }
+        return String.format(Locale.US, "%-9s%s%-22s%8s  %s%n",
+                label, marker, value, age, freshness);
     }
 
     @Override
     public void onLog(String message) {
-        handler.post(() -> {
-            lastLog = message;
-            render();
-        });
-    }
-
-    private void render() {
-        TelemetryState s = state;
-        StringBuilder sb = new StringBuilder();
-        line(sb, "Mode", s.flightMode);
-        line(sb, "Armed", s.armed ? "ARMED" : "DISARMED");
-        line(sb, "Latitude", String.format(Locale.US, "%.7f", s.latitude));
-        line(sb, "Longitude", String.format(Locale.US, "%.7f", s.longitude));
-        line(sb, "Alt (rel)", String.format(Locale.US, "%.2f m", s.relativeAltitudeM));
-        line(sb, "Ground speed", String.format(Locale.US, "%.2f m/s", s.groundSpeedMs));
-        line(sb, "Heading", String.format(Locale.US, "%.1f deg", s.headingDeg));
-        line(sb, "Roll", String.format(Locale.US, "%.1f deg", s.rollDeg));
-        line(sb, "Pitch", String.format(Locale.US, "%.1f deg", s.pitchDeg));
-        line(sb, "Battery", String.format(Locale.US, "%.2f V", s.batteryVolts));
-        line(sb, "Remaining", s.batteryPercent + " %");
-        line(sb, "Updated", s.updatedAtMillis == 0
-                ? "-"
-                : timeFormat.format(new Date(s.updatedAtMillis)));
-        line(sb, "Status", lastLog);
-        telemetry.setText(sb.toString());
-    }
-
-    private static void line(StringBuilder sb, String label, String value) {
-        sb.append(String.format(Locale.US, "%-14s %s%n", label, value));
+        lastLog = message;
     }
 }
